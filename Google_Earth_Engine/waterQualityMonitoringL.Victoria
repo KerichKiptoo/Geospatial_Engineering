@@ -1,0 +1,263 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var aoi = ee.FeatureCollection("projects/ee-atoo/assets/lake_victoria");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+/*
+========================================================================================
+5. COMPUTE OTHER RS METRICS FROM MASKED DATA SETS
+========================================================================================
+*/
+
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR");
+
+
+Map.centerObject(aoi)
+// Write a function for Cloud masking
+function maskS2clouds(image) {
+  var qa = image.select('QA60')
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0))
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"])
+}
+var nocloud =  s2
+  .filter(ee.Filter.date('2022-01-01', '2022-12-31'))
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .filter(ee.Filter.bounds(aoi))
+  .map(maskS2clouds);
+
+
+function addIndices(image){
+  var rangeBands = {
+                      'blue': image.select('B2'),
+                      'green':image.select('B3'),
+                      'red': image.select('B4'),
+                      'nir': image.select('B8'),
+                      'swir1': image.select('B11'),
+                    };
+                    
+                    
+                    
+                    
+/////////////////////////////////////////////////////////////////////////
+//Turbidity
+
+var s2_turbidity_alg = function(image) {
+          var turbidity = image.expression(
+              '(A_t*log(p_w/p_z)+C)', {
+                  'p_w': image.select('B3'), //red band mid wv_len = 645.5nm
+                  'p_z': image.select('B2'), //calib param (MAIN)
+                  'A_t': 15.31, //calib param (MAIN)
+                  'C': 3.497, //calib param (MAIN)
+                  'pi': Math.PI,
+                  'scale_factor': 1.0 //band info
+              }).rename('s2_turb');
+          var turb_mask = turbidity.updateMask(turbidity.gte(0));
+          return(turb_mask.rename('s2_turb').clip(aoi));
+    };
+
+var S2L1_turb = nocloud.map(s2_turbidity_alg)
+
+
+////////////Visual Parameters/////////////////////////////////////////////////////////
+ var turb_viz = {
+  min:0,
+  max:100,
+  palette: ['332288', '88CCEE', '44AA99', '999933', 'DDCC77', 'CC6677', '882255', 'AA4499']
+};
+// Chlorophyll-a
+var mishra_viz = {
+  bands: "s2_chl",
+  min: 0,
+  max: 50,
+  palette: ['2372EF','23EF30']
+};
+var ndci_viz = {
+  bands: "NDCI",
+  min:-1,
+  max:1,
+  palette: ['0000FF','3333FF','6666FF','9999FF','99FFCC','66FFB2','33FF99','00FF80']
+};
+
+
+///////////////////////////////////////////////////////////////////////////////////////
+
+Map.addLayer(S2L1_turb.median(),turb_viz,'turbidity')
+
+//NDCI
+var ndci_totalMask = function(collection) {
+  var mask_ndci = function(image) {
+    var ndci_band = image.select('NDCI');
+    var mask = ndci_band.lte(1).and(ndci_band.gte(-1.0));
+    var masked_band = image.updateMask(mask);
+  return masked_band;
+  };
+  var masked_ndci = collection.map(mask_ndci);
+  function threshold(image) {
+    return image.set('NDCI', image.get('NDCI'));}
+  var final_ndciColl = masked_ndci.map(threshold);
+  return final_ndciColl;
+};
+
+//CHL
+var chl_totalMask = function(collection) {
+  var mask_chl = function (image) {
+    var chl_band = image.select('s2_chl');
+    var mask = chl_band.lte(70).gte(0);
+    var masked_band = image.updateMask(mask);
+  return masked_band;
+  };
+  var masked_chl = collection.map(mask_chl);
+  function threshold(image) {
+    return image.set('s2_chl', image.get('s2_chl'));}
+  var final_chlColl = masked_chl.map(threshold);
+  return final_chlColl;
+}
+
+  // Chlorophyll-a Algorithm
+    // defining a function to obtain the Normalized Difference Chlorophyll Index (NDCI) from an image
+var ndci_algorithm = function(image){
+          var ndci = image.expression(
+            '((B5*sf) - (B4*sf))/((B5*sf) + (B4*sf))', {
+              'B4': image.select('B4'),
+              'B5': image.select('B5'),
+              'sf': 0.0001
+            }).rename('NDCI');
+          return(ndci.rename('NDCI').set('system:time_start', image.get('system:time_start'))
+                      .set('CLOUDY_PIXEL_PERCENTAGE', image.get('CLOUDY_PIXEL_PERCENTAGE')));
+    };
+    // Derive the chlorophyll-a concentration using NDCI, adapted from Chlorophyll-a Algorithm above
+var mishra_algorithm = function(image){
+          var mishra = image.expression(
+            'a0 + (a1 * ndci) + (a2 * ndci_sqrd)', {
+              'a0': 16.93,
+              'a1': 142.2,
+              'a2': 182.3,
+              'ndci': ndci_algorithm(image).select('NDCI'),
+              'ndci_sqrd': ndci_algorithm(image).select('NDCI').pow(2),
+            }).rename('s2_chl');
+          return(mishra.updateMask(mishra.lt(70)).clip(aoi));
+    };
+
+
+var S2L1_NDCI = nocloud.map(ndci_algorithm);
+var S2L1_chla = nocloud.map(mishra_algorithm);
+
+
+
+Map.addLayer(S2L1_chla.median(),mishra_viz,'chlorophyll a')
+Map.addLayer(S2L1_NDCI.median().clip(aoi),ndci_viz,'NDCI')
+Export.image.toDrive({
+    image: S2L1_chla.median(),
+    description: 'Chlorophyll2022',
+    folder: 'earthengine',
+    fileNamePrefix: 'Chlorophyll2022',
+    region: aoi,
+    maxPixels: 1e13,
+    scale: 30,
+})
+Export.image.toDrive({
+    image: S2L1_NDCI.median().clip(aoi),
+    description: 'NDCI2022',
+    folder: 'earthengine',
+    fileNamePrefix: 'NDCI2022',
+    region: aoi,
+    maxPixels: 1e13,
+    scale: 30,
+})
+
+Export.image.toDrive({
+    image: S2L1_turb.median(),
+    description: 'Turbidity2022',
+    folder: 'earthengine',
+    fileNamePrefix: 'Turbidity2022',
+    region: aoi,
+    maxPixels: 1e13,
+    scale: 30,
+})
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////// STABLE INPUTS /////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+                   
+  //NDVI
+  var ndvi = image.expression({
+    expression: '(nir - red) / (nir + red)',
+    map: rangeBands
+  });
+  
+//GARI
+  var gari = image.expression({
+    expression: '(nir -(green-(blue-red))) / (nir - green +(blue - red))',
+    map: rangeBands
+  });
+
+  //chlorophyll
+  var chl = image.expression({
+    expression: '(nir/green)-1',
+    map: rangeBands
+  });
+  
+  //SAVI
+ var savi = image.expression({
+   expression: '((nir-red)/(nir+red+0.5))*1.5',
+   map: rangeBands
+ });
+ //NDWI
+ var ndwi = image.expression({
+   expression: '(green - nir) / (green + nir)',
+   map: rangeBands
+ });
+ 
+  image = image.addBands(ndvi.clip(aoi).rename('ndvi'))
+               .addBands(savi.clip(aoi).rename('savi'))
+               .addBands(gari.clip(aoi).rename('gari'))
+               .addBands(ndwi.clip(aoi).rename('ndwi'));
+  return image.float();
+}
+
+
+//Compute indices and add to image median image composite
+var image = nocloud.map(addIndices);
+var indices = image.select('ndvi','savi','ndwi', 'gari');
+print("Indices ", indices.first().bandNames());
+
+var savi = indices.select('savi').median()
+var ndvi = indices.select('ndvi').median()
+var ndwi = indices.select('ndwi').median()
+var gari = indices.select('gari').median()
+
+
+// Map.addLayer(ndwi)
+/*
+Export.image.toDrive({
+    image: ndvi,
+    description: 'ndvi',
+    folder: 'earthengine',
+    fileNamePrefix: 'ndvi',
+    region: aoi,
+    maxPixels: 1e13,
+    scale: 30,
+})
+
+Export.image.toDrive({
+    image: ndvi,
+    description: 'savi',
+    folder: 'earthengine',
+    fileNamePrefix: 'savi',
+    region: aoi,
+    maxPixels: 1e13,
+    scale: 30,
+})
+
+Export.image.toDrive({
+    image: ndvi,
+    description: 'ndwi',
+    folder: 'earthengine',
+    fileNamePrefix: 'ndwi',
+    region: aoi,
+    maxPixels: 1e13,
+    scale: 30,
+})
+*/
