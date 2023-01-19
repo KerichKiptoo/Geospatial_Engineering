@@ -1,2 +1,3 @@
 ## Geospatial Engineering Projects
-These are the projects I have been involved 
+Platforms used include: * Google Earth Engine
+                        * Digital Earth Africa
